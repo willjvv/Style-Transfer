@@ -1,79 +1,67 @@
-# style_transfer_mvp.py
+# style_transfer_fixed.py
 import tensorflow as tf
 import numpy as np
 from PIL import Image
 import time
 import os
 
-print("Style Transfer MVP - Starting up...")
+print("Style Transfer - Starting up...")
 print(f"TensorFlow version: {tf.__version__}")
 
-# =============================================================================
-# 1. FIXED PARAMETERS (Edit these for your specific images)
-# =============================================================================
+# ============================================================================
+# 1. PARAMETERS (Edit these for your specific images)
+# ============================================================================
 CONTENT_PATH = "content.tif"    # Your photography TIFF file
 STYLE_PATH = "style.jpg"         # The artistic style image (JPEG or TIFF)
 OUTPUT_PATH = "output.tif"      # Where to save the result
 
 # Quality/Performance trade-offs
 MAX_DIM = 512                    # Maximum dimension (longest side)
-CONTENT_WEIGHT = 1e3             # How much to preserve original content
-STYLE_WEIGHT = 8e-1              # How strong to apply the style
-OPTIMIZER_STEPS = 1000           # More steps = better quality but slower
+CONTENT_WEIGHT = 1e4             # How much to prioritize original content
+STYLE_WEIGHT = 1e-2              # How much to prioritize the artistic style
+OPTIMIZER_STEPS = 1000           # More steps = better quality, but slower
 
-# =============================================================================
-# 2. HELPER FUNCTIONS
-# =============================================================================
-def load_and_process_img(path, target_size=None):
-    """Load and preprocess an image for the VGG network.
-    
-    If target_size is provided, resize to that. Otherwise, scale
-    based on MAX_DIM.
-    """
+# ============================================================================
+# 2. IMAGE HANDLING FUNCTIONS
+# ============================================================================
+def load_and_process_img(path):
+    """Load and preprocess an image for the VGG network."""
     print(f"Loading image: {path}")
     
     # Open with PIL and ensure it's RGB
     img = Image.open(path).convert('RGB')
     original_size = img.size
     print(f"  Original size: {original_size}")
-
-    # Calculate new size
-    new_size = target_size
-    if new_size is None:
-        scale = MAX_DIM / max(img.size)
-        new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
+    
+    # Calculate new size while maintaining aspect ratio
+    scale = MAX_DIM / max(img.size)
+    new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
     img = img.resize(new_size, Image.Resampling.LANCZOS)
     print(f"  Resized to: {new_size}")
     
-    # Convert to numpy array and add batch dimension
-    img_array = np.array(img)
-    img_array = np.expand_dims(img_array, axis=0)
+    # Convert to a numpy array and normalize to the 0-1 range
+    img_array = np.array(img, dtype=np.float32) / 255.0
     
-    # Preprocess for VGG19 (same as used during training)
-    img_array = tf.keras.applications.vgg19.preprocess_input(img_array)
+    # Add batch dimension
+    img_array = np.expand_dims(img_array, axis=0)
     return tf.constant(img_array)
 
 def deprocess_img(tensor):
-    """Convert processed tensor back to PIL Image"""
+    """Convert a processed tensor back to a PIL Image."""
     tensor = tensor.numpy()
     if len(tensor.shape) == 4:
         tensor = tensor[0]  # Remove batch dimension
     
-    # Reverse VGG19 preprocessing
-    tensor[:, :, 0] += 103.939
-    tensor[:, :, 1] += 116.779
-    tensor[:, :, 2] += 123.68
-    tensor = tensor[:, :, ::-1]  # BGR to RGB
-    
-    # Clip to valid image range and convert to uint8
+    # Convert from 0-1 back to 0-255
+    tensor = tensor * 255.0
     tensor = np.clip(tensor, 0, 255).astype('uint8')
     return Image.fromarray(tensor)
 
-# =============================================================================
+# ============================================================================
 # 3. MODEL & LOSS FUNCTIONS
-# =============================================================================
+# ============================================================================
 def get_model():
-    """Create our model with access to intermediate layers"""
+    """Create a VGG19 model with access to intermediate layer outputs."""
     # Load pre-trained VGG19
     vgg = tf.keras.applications.VGG19(include_top=False, weights='imagenet')
     vgg.trainable = False
@@ -94,47 +82,60 @@ def get_model():
     return model, style_layers, content_layers
 
 def gram_matrix(input_tensor):
-    """Calculate Gram matrix for style representation"""
-    result = tf.linalg.einsum('bijc,bijd->bcd', input_tensor, input_tensor)
-    input_shape = tf.shape(input_tensor)
-    num_locations = tf.cast(input_shape[1] * input_shape[2], tf.float32)
-    return result / num_locations
+    """Calculate the Gram matrix for style representation."""
+    # Flatten the spatial dimensions and compute correlations
+    channels = int(input_tensor.shape[-1])
+    a = tf.reshape(input_tensor, [-1, channels])
+    n = tf.cast(tf.shape(a)[0], tf.float32)
+    gram = tf.matmul(a, a, transpose_a=True)
+    return gram / n
 
 def style_loss(style_outputs, style_targets):
-    """Calculate style loss"""
-    loss = tf.add_n([
-        tf.reduce_mean((style_outputs[name] - style_targets[name])**2)
-        for name in style_outputs.keys()
-    ])
+    """Calculate style loss with normalization."""
+    loss = 0
+    for name in style_outputs.keys():
+        style_output = style_outputs[name]
+        style_target = style_targets[name]
+        
+        # Calculate Gram matrices
+        gram_style = gram_matrix(style_output)
+        gram_target = gram_matrix(style_target)
+        
+        # Normalize by number of layers and features
+        layer_loss = tf.reduce_mean((gram_style - gram_target) ** 2)
+        loss += layer_loss / (4.0 * (style_output.shape[-1] ** 2) * (np.prod(style_output.shape[1:-1]) ** 2))
+    
     return loss / len(style_outputs)
 
 def content_loss(content_outputs, content_targets):
-    """Calculate content loss"""
-    return tf.add_n([
-        tf.reduce_mean((content_outputs[name] - content_targets[name])**2)
-        for name in content_outputs.keys()
-    ])
+    """Calculate content loss."""
+    loss = 0
+    for name in content_outputs.keys():
+        content_output = content_outputs[name]
+        content_target = content_targets[name]
+        loss += tf.reduce_mean((content_output - content_target) ** 2)
+    return loss / len(content_outputs)
 
 def compute_loss(model, loss_weights, generated_image, content_targets, style_targets):
-    """Compute total loss"""
+    """Compute the total weighted loss."""
     # Get model outputs for the generated image
-    model_outputs = model(generated_image)
+    model_outputs = model(generated_image * 255.0)  # Scale for VGG preprocessing
     
     # Split outputs into style and content
     style_outputs = model_outputs[:len(style_targets)]
     content_outputs = model_outputs[len(style_targets):]
     
     # Convert to dictionaries for easier handling
-    style_outputs = {
-        style_name: output for style_name, output in zip(style_targets.keys(), style_outputs)
+    style_outputs_dict = {
+        f'style_{i}': output for i, output in enumerate(style_outputs)
     }
-    content_outputs = {
-        content_name: output for content_name, output in zip(content_targets.keys(), content_outputs)
+    content_outputs_dict = {
+        f'content_{i}': output for i, output in enumerate(content_outputs)
     }
     
     # Calculate individual losses
-    style_loss_value = style_loss(style_outputs, style_targets)
-    content_loss_value = content_loss(content_outputs, content_targets)
+    style_loss_value = style_loss(style_outputs_dict, style_targets)
+    content_loss_value = content_loss(content_outputs_dict, content_targets)
     
     # Weighted total loss
     total_loss = (
@@ -144,61 +145,57 @@ def compute_loss(model, loss_weights, generated_image, content_targets, style_ta
     
     return total_loss, style_loss_value, content_loss_value
 
-# =============================================================================
+# ============================================================================
 # 4. TARGET COMPUTATION
-# =============================================================================
+# ============================================================================
 def get_targets(model, content_image, style_image):
-    """Precompute the content and style targets"""
+    """Precompute the content and style targets."""
     print("Computing content and style targets...")
     
-    # Get model outputs for content image
-    content_outputs = model(content_image)
-    style_layers = content_outputs[:5]  # First 5 outputs are style layers
-    content_layers = content_outputs[5:]  # Last 1 output is content layer
+    # Scale images for VGG preprocessing (VGG expects 0-255)
+    content_scaled = content_image * 255.0
+    style_scaled = style_image * 255.0
     
+    # Get model outputs
+    content_outputs = model(content_scaled)
+    style_outputs = model(style_scaled)
+    
+    # Split outputs into style and content targets based on the model definition
     style_targets = {
-        f'style_{i}': output for i, output in enumerate(style_layers)
+        f'style_{i}': output for i, output in enumerate(style_outputs[:5])
     }
     content_targets = {
-        f'content_{i}': output for i, output in enumerate(content_layers)
-    }
-    
-    # Get model outputs for style image
-    style_outputs = model(style_image)
-    style_outputs = style_outputs[:5]  # Only need style layers
-    
-    style_targets = {
-        f'style_{i}': output for i, output in enumerate(style_outputs)
+        f'content_{i}': output for i, output in enumerate(content_outputs[5:])
     }
     
     return content_targets, style_targets
 
-# =============================================================================
+# ============================================================================
 # 5. TRAINING STEP
-# =============================================================================
+# ============================================================================
 @tf.function
 def train_step(model, loss_weights, generated_image, content_targets, style_targets, optimizer):
-    """Single training step"""
+    """Perform a single training step."""
     with tf.GradientTape() as tape:
         total_loss, style_loss, content_loss = compute_loss(
             model, loss_weights, generated_image, content_targets, style_targets
         )
     
-    # Compute gradient and apply to the generated image
+    # Compute gradient and apply with clipping
     grad = tape.gradient(total_loss, generated_image)
     optimizer.apply_gradients([(grad, generated_image)])
     
-    # Clamp pixel values
-    generated_image.assign(tf.clip_by_value(generated_image, clip_value_min=0.0, clip_value_max=255.0))
+    # Clamp pixel values to the valid 0-1 range
+    generated_image.assign(tf.clip_by_value(generated_image, 0.0, 1.0))
     
     return total_loss, style_loss, content_loss
 
-# =============================================================================
+# ============================================================================
 # 6. MAIN EXECUTION
-# =============================================================================
+# ============================================================================
 def main():
     print("\n" + "="*50)
-    print("NEURAL STYLE TRANSFER MVP")
+    print("NEURAL STYLE TRANSFER")
     print("="*50)
     
     # Check if files exist
@@ -209,12 +206,10 @@ def main():
         print(f"ERROR: Style image not found at {STYLE_PATH}")
         return
     
-    # Load images
+    # Load images into the 0-1 range
     print("\n1. Loading images...")
     content_image = load_and_process_img(CONTENT_PATH)
-    # Resize style image to match content image dimensions
-    content_shape = tf.shape(content_image)[1:3]
-    style_image = load_and_process_img(STYLE_PATH, target_size=(content_shape[1], content_shape[0]))
+    style_image = load_and_process_img(STYLE_PATH)
     
     # Create model
     print("\n2. Loading VGG19 model...")
@@ -224,11 +219,16 @@ def main():
     print("\n3. Computing style and content targets...")
     content_targets, style_targets = get_targets(model, content_image, style_image)
     
-    # Initialize generated image (start with content image)
+    # Initialize the generated image from the content image
     generated_image = tf.Variable(content_image, dtype=tf.float32)
     
-    # Setup optimizer and loss weights
-    optimizer = tf.optimizers.Adam(learning_rate=0.02, beta_1=0.99, epsilon=1e-1)
+    # Configure the optimizer
+    optimizer = tf.optimizers.Adam(
+        learning_rate=0.01,  # Reduced learning rate
+        beta_1=0.99, 
+        epsilon=1e-1
+    )
+    
     loss_weights = {'style': STYLE_WEIGHT, 'content': CONTENT_WEIGHT}
     
     print(f"\n4. Starting optimization for {OPTIMIZER_STEPS} steps...")
