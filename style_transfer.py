@@ -14,10 +14,11 @@ STYLE_PATH = "style.jpg"        # The artistic style image (JPEG or TIFF)
 OUTPUT_PATH = "output.tif"      # Where to save the result
 
 # Quality/Performance trade-offs
-MAX_DIM = 1024                    # Maximum dimension (longest side)
-CONTENT_WEIGHT = 1e3             # How much to prioritize original content
-STYLE_WEIGHT = 1.5e-2              # How much to prioritize the artistic style
-OPTIMIZER_STEPS = 1000           # More steps = better quality, but slower
+MAX_DIM = 2048                    # Maximum dimension (longest side)
+CONTENT_WEIGHT = 1e2              # How much to prioritize original content
+STYLE_WEIGHT = 1e-2               # How much to prioritize the artistic style
+TOTAL_VARIATION_WEIGHT = 10       # How much to penalize image noise (for smoothness)
+OPTIMIZER_STEPS = 1000            # More steps = better quality, but slower
 
 # --- 2. Image Handling ---
 
@@ -173,7 +174,7 @@ def compute_loss(model, loss_weights, generated_image, content_targets, style_ta
         style_targets (dict): Precomputed style feature maps.
 
     Returns:
-        tuple: Total loss, style loss, and content loss.
+        tuple: Total loss, style loss, content loss, and total variation loss.
     """
     # Get model outputs for the generated image
     model_outputs = model(generated_image * 255.0)  # Scale for VGG preprocessing
@@ -193,14 +194,16 @@ def compute_loss(model, loss_weights, generated_image, content_targets, style_ta
     # Calculate individual losses
     style_loss_value = style_loss(style_outputs_dict, style_targets)
     content_loss_value = content_loss(content_outputs_dict, content_targets)
+    total_variation_loss_value = tf.image.total_variation(generated_image)
     
     # Weighted total loss
     total_loss = (
         loss_weights['style'] * style_loss_value + 
-        loss_weights['content'] * content_loss_value
+        loss_weights['content'] * content_loss_value +
+        loss_weights['total_variation'] * total_variation_loss_value
     )
     
-    return total_loss, style_loss_value, content_loss_value
+    return total_loss, style_loss_value, content_loss_value, total_variation_loss_value
 
 # --- 4. Target Computation ---
 
@@ -252,13 +255,13 @@ def train_step(model, loss_weights, generated_image, content_targets, style_targ
         optimizer (tf.optimizers.Optimizer): The optimizer.
 
     Returns:
-        tuple: Total loss, style loss, and content loss for the step.
+        tuple: Total loss, style loss, content loss, and total variation loss for the step.
     """
     with tf.GradientTape() as tape:
-        total_loss, style_loss, content_loss = compute_loss(
+        losses = compute_loss(
             model, loss_weights, generated_image, content_targets, style_targets
         )
-    
+    total_loss = losses[0]
     # Compute gradient and apply with clipping
     grad = tape.gradient(total_loss, generated_image)
     optimizer.apply_gradients([(grad, generated_image)])
@@ -266,7 +269,7 @@ def train_step(model, loss_weights, generated_image, content_targets, style_targ
     # Clamp pixel values to the valid 0-1 range
     generated_image.assign(tf.clip_by_value(generated_image, 0.0, 1.0))
     
-    return total_loss, style_loss, content_loss
+    return losses
 
 # --- 6. Main Execution ---
 
@@ -319,7 +322,11 @@ def main():
         epsilon=1e-1
     )
     
-    loss_weights = {'style': STYLE_WEIGHT, 'content': CONTENT_WEIGHT}
+    loss_weights = {
+        'style': STYLE_WEIGHT, 
+        'content': CONTENT_WEIGHT,
+        'total_variation': TOTAL_VARIATION_WEIGHT
+    }
     
     print(f"\n4. Starting optimization for {OPTIMIZER_STEPS} steps...")
     print("   (This will take several minutes)")
@@ -327,16 +334,20 @@ def main():
     
     # Training loop
     for step in range(OPTIMIZER_STEPS):
-        total_loss, style_loss_val, content_loss_val = train_step(
+        (total_loss, 
+         style_loss_val, 
+         content_loss_val, 
+         tv_loss_val) = train_step(
             model, loss_weights, generated_image, content_targets, style_targets, optimizer
         )
         
         if step % 100 == 0:
             elapsed = time.time() - start_time
             print(f"   Step {step:4d}/{OPTIMIZER_STEPS}: "
-                  f"Total Loss: {total_loss:.2e}, "
-                  f"Style: {style_loss_val:.2e}, "
-                  f"Content: {content_loss_val:.2e}, "
+                  f"Total Loss: {float(total_loss.numpy()):.2e}, "
+                  f"Style: {float(style_loss_val.numpy()):.2e}, "
+                  f"Content: {float(content_loss_val.numpy()):.2e}, "
+                  f"TV: {float(tv_loss_val[0].numpy()):.2e}, "
                   f"Time: {elapsed:.1f}s")
     
     total_time = time.time() - start_time
